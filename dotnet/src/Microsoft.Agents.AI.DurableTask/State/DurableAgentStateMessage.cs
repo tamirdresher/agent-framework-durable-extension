@@ -69,6 +69,23 @@ internal sealed class DurableAgentStateMessage
         ChatMessage message,
         string? generatedMessageId = null,
         ILogger? logger = null)
+        => FromChatMessage(message, generatedMessageId, includeContents: true, logger: logger);
+
+    /// <summary>
+    /// Creates a metadata-only durable message without transcript content.
+    /// </summary>
+    public static DurableAgentStateMessage FromChatMessageMetadata(
+        ChatMessage message,
+        string generatedMessageId,
+        DateTimeOffset createdAt)
+        => FromChatMessage(message, generatedMessageId, includeContents: false, createdAt);
+
+    private static DurableAgentStateMessage FromChatMessage(
+        ChatMessage message,
+        string? generatedMessageId,
+        bool includeContents,
+        DateTimeOffset? defaultCreatedAt = null,
+        ILogger? logger = null)
     {
         Dictionary<string, JsonElement>? additionalProperties = message.AdditionalProperties?
             .ToDictionary(
@@ -79,13 +96,15 @@ internal sealed class DurableAgentStateMessage
 
         return new DurableAgentStateMessage()
         {
-            CreatedAt = message.CreatedAt,
+            CreatedAt = message.CreatedAt ?? defaultCreatedAt,
             AuthorName = message.AuthorName,
             MessageId = message.MessageId ?? generatedMessageId,
             AdditionalProperties = additionalProperties,
             Role = message.Role.ToString(),
-            Contents = message.Contents.Select(content =>
-                DurableAgentStateContent.FromAIContent(content, logger)).ToList()
+            Contents = includeContents
+                ? message.Contents.Select(content =>
+                    DurableAgentStateContent.FromAIContent(content, logger)).ToList()
+                : []
         };
     }
 
@@ -109,6 +128,41 @@ internal sealed class DurableAgentStateMessage
             AdditionalProperties = additionalProperties,
             Contents = this.Contents.Select(c => c.ToAIContent()).ToList(),
             Role = new(this.Role)
+        };
+    }
+
+    /// <summary>
+    /// Converts this message to model context, omitting provider-specific reasoning content.
+    /// </summary>
+    /// <remarks>
+    /// Reasoning is retained in durable storage for schema fidelity but is not replayed because it
+    /// can be provider-specific, rejected by another API, or expose chain-of-thought. A message with
+    /// other content keeps that content; a reasoning-only or metadata-only message has no model
+    /// payload and returns <see langword="null"/>.
+    /// </remarks>
+    public ChatMessage? ToReplayableChatMessage()
+    {
+        List<DurableAgentStateContent> replayableContents =
+            this.Contents.Where(content => content is not DurableAgentStateTextReasoningContent).ToList();
+        if (replayableContents.Count == 0)
+        {
+            return null;
+        }
+
+        AdditionalPropertiesDictionary? additionalProperties = this.AdditionalProperties is null
+            ? null
+            : new AdditionalPropertiesDictionary(
+                this.AdditionalProperties.Select(pair =>
+                    new KeyValuePair<string, object?>(pair.Key, pair.Value)));
+
+        return new ChatMessage
+        {
+            CreatedAt = this.CreatedAt,
+            AuthorName = this.AuthorName,
+            MessageId = this.MessageId,
+            AdditionalProperties = additionalProperties,
+            Contents = replayableContents.ConvertAll(static content => content.ToAIContent()),
+            Role = new(this.Role),
         };
     }
 }
