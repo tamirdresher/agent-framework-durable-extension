@@ -17,6 +17,9 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
     private readonly ILoggerFactory _loggerFactory = services.GetRequiredService<ILoggerFactory>();
     private readonly IAgentResponseHandler? _messageHandler = services.GetService<IAgentResponseHandler>();
     private readonly DurableAgentsOptions _options = services.GetRequiredService<DurableAgentsOptions>();
+    // Entity operations execute once rather than replaying like orchestrations, and
+    // TaskEntityContext does not expose a deterministic clock.
+    private readonly TimeProvider _timeProvider = services.GetService<TimeProvider>() ?? TimeProvider.System;
     private readonly CancellationToken _cancellationToken = cancellationToken != default
         ? cancellationToken
         : services.GetService<IHostApplicationLifetime>()?.ApplicationStopping ?? CancellationToken.None;
@@ -33,20 +36,58 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
 #pragma warning restore VSTHRD200
 #pragma warning restore IDE1006
     {
+        ArgumentNullException.ThrowIfNull(request);
+
         AgentSessionId sessionId = this.Context.Id;
+        ILogger logger = this.GetLogger(sessionId.Name, sessionId.Key);
+
+        string correlationId = request.CorrelationId;
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            throw new ArgumentException(
+                "A non-empty correlation ID is required to run a durable agent request.",
+                nameof(request));
+        }
+
+        DurableAgentStateResponse? existingResponse;
+        try
+        {
+            existingResponse = DurableAgentStateTerminalResponseLookup.FindUniqueTerminalResponse(
+                this.State.Data.ConversationHistory,
+                correlationId);
+        }
+        catch (DurableAgentStateCorruptionException exception)
+        {
+            logger.LogTerminalResponseStateCorruption(
+                exception,
+                sessionId,
+                correlationId,
+                exception.TerminalResponseCount.GetValueOrDefault());
+            throw;
+        }
+
+        if (existingResponse is not null)
+        {
+            // Correlation is the caller's idempotency key. Retained terminal state is reused
+            // without comparing request content, so callers must not reuse it for another request.
+            return existingResponse.ToResponse();
+        }
+
+        if (request.Messages is not { Count: > 0 })
+        {
+            throw new ArgumentException(
+                "At least one message is required for a new durable agent request.",
+                nameof(request));
+        }
+
         AIAgent agent = this.GetAgent(sessionId);
         EntityAgentWrapper agentWrapper = new(agent, this.Context, request, this._services);
 
-        // Logger category is Microsoft.DurableTask.Agents.{agentName}.{sessionId}
-        ILogger logger = this.GetLogger(agent.Name!, sessionId.Key);
-
-        if (request.Messages.Count == 0)
-        {
-            logger.LogInformation("Ignoring empty request");
-            return new AgentResponse();
-        }
-
-        this.State.Data.ConversationHistory.Add(DurableAgentStateRequest.FromRunRequest(request));
+        // TaskEntity hydrates State with the backend-owned object. Mutate an independent copy so
+        // an exception leaves the hydrated state unchanged.
+        DurableAgentState workingState = this.State.Clone();
+        workingState.Data.ConversationHistory.Add(
+            DurableAgentStateRequest.FromRunRequest(request, logger));
 
         foreach (ChatMessage msg in request.Messages)
         {
@@ -66,7 +107,7 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
         {
             // Start the agent response stream
             IAsyncEnumerable<AgentResponseUpdate> responseStream = agentWrapper.RunStreamingAsync(
-                this.State.Data.ConversationHistory.SelectMany(e => e.Messages).Select(m => m.ToChatMessage()),
+                workingState.Data.ConversationHistory.SelectMany(e => e.Messages).Select(m => m.ToChatMessage()),
                 await agentWrapper.CreateSessionAsync(cancellationToken).ConfigureAwait(false),
                 options: null,
                 this._cancellationToken);
@@ -102,8 +143,8 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
             }
 
             // Persist the agent response to the entity state for client polling
-            this.State.Data.ConversationHistory.Add(
-                DurableAgentStateResponse.FromResponse(request.CorrelationId, response));
+            workingState.Data.ConversationHistory.Add(
+                DurableAgentStateResponse.FromResponse(correlationId, response, logger));
 
             string responseText = response.Text;
 
@@ -118,37 +159,15 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
                     response.Usage?.TotalTokenCount);
             }
 
-            // Update TTL expiration time. Only schedule deletion check on first interaction.
-            // Subsequent interactions just update the expiration time; CheckAndDeleteIfExpiredAsync
-            // will reschedule the deletion check when it runs.
-            TimeSpan? timeToLive = this._options.GetTimeToLive(sessionId.Name);
-            if (timeToLive.HasValue)
-            {
-                DateTime newExpirationTime = DateTime.UtcNow.Add(timeToLive.Value);
-                bool isFirstInteraction = this.State.Data.ExpirationTimeUtc is null;
-
-                this.State.Data.ExpirationTimeUtc = newExpirationTime;
-                logger.LogTTLExpirationTimeUpdated(sessionId, newExpirationTime);
-
-                // Only schedule deletion check on the first interaction when entity is created.
-                // On subsequent interactions, we just update the expiration time. The scheduled
-                // CheckAndDeleteIfExpiredAsync will reschedule itself if the entity hasn't expired.
-                if (isFirstInteraction)
-                {
-                    this.ScheduleDeletionCheck(sessionId, logger, timeToLive.Value);
-                }
-            }
-            else
-            {
-                // TTL is disabled. Clear the expiration time if it was previously set.
-                if (this.State.Data.ExpirationTimeUtc.HasValue)
-                {
-                    logger.LogTTLExpirationTimeCleared(sessionId);
-                    this.State.Data.ExpirationTimeUtc = null;
-                }
-            }
+            DateTime? deletionCheckExpiration = this.UpdateExpiration(workingState, sessionId, logger);
+            this.CommitWorkingState(workingState, sessionId, logger, deletionCheckExpiration);
 
             return response;
+        }
+        catch (Exception exception)
+        {
+            logger.LogDurableAgentExecutionFailed(exception, sessionId);
+            throw;
         }
         finally
         {
@@ -163,41 +182,75 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
     /// <remarks>
     /// This method is called by the durable task runtime when a <c>CheckAndDeleteIfExpired</c> signal is received.
     /// </remarks>
-    public void CheckAndDeleteIfExpired()
+    public void CheckAndDeleteIfExpired(AgentEntityDeletionCheck? scheduledCheck = null)
     {
         AgentSessionId sessionId = this.Context.Id;
-        AIAgent agent = this.GetAgent(sessionId);
-        ILogger logger = this.GetLogger(agent.Name!, sessionId.Key);
+        ILogger logger = this.GetLogger(sessionId.Name, sessionId.Key);
 
-        DateTime currentTime = DateTime.UtcNow;
+        DateTime currentTime = this._timeProvider.GetUtcNow().UtcDateTime;
         DateTime? expirationTime = this.State.Data.ExpirationTimeUtc;
 
         logger.LogTTLDeletionCheck(sessionId, expirationTime, currentTime);
 
-        if (expirationTime.HasValue)
+        // A delayed signal can outlive a deleted entity. TaskEntity initializes missing state
+        // before dispatch, so remove that otherwise-empty placeholder instead of recreating it.
+        if (!expirationTime.HasValue && IsEmptyInitializedState(this.State))
         {
-            if (currentTime >= expirationTime.Value)
+            this.State = null!;
+            return;
+        }
+
+        if (!this._options.ContainsAgent(sessionId.Name) ||
+            !this._options.GetTimeToLive(sessionId.Name).HasValue)
+        {
+            if (expirationTime.HasValue)
             {
-                // Entity has expired, delete it
-                logger.LogTTLEntityExpired(sessionId, expirationTime.Value);
-                this.State = null!;
+                logger.LogTTLExpirationTimeCleared(sessionId);
+                this.State.Data.ExpirationTimeUtc = null;
             }
-            else
-            {
-                // Entity hasn't expired yet, reschedule the deletion check
-                TimeSpan? timeToLive = this._options.GetTimeToLive(sessionId.Name);
-                if (timeToLive.HasValue)
-                {
-                    this.ScheduleDeletionCheck(sessionId, logger, timeToLive.Value);
-                }
-            }
+
+            return;
+        }
+
+        if (!expirationTime.HasValue)
+        {
+            return;
+        }
+
+        if (currentTime >= expirationTime.Value)
+        {
+            logger.LogTTLEntityExpired(sessionId, expirationTime.Value);
+            this.State = null!;
+            return;
+        }
+
+        // A shorter TTL creates an earlier signal. Its older, later counterpart is stale.
+        if (scheduledCheck is null ||
+            scheduledCheck.ExpectedExpirationTimeUtc <= expirationTime.Value)
+        {
+            this.ScheduleDeletionCheck(sessionId, logger, expirationTime.Value);
         }
     }
 
-    private void ScheduleDeletionCheck(AgentSessionId sessionId, ILogger logger, TimeSpan timeToLive)
+    private static bool IsEmptyInitializedState(DurableAgentState state)
     {
-        DateTime currentTime = DateTime.UtcNow;
-        DateTime expirationTime = this.State.Data.ExpirationTimeUtc ?? currentTime.Add(timeToLive);
+        return state.Data.ConversationHistory.Count == 0 &&
+            state.Data.Session is null &&
+            state.Data.IngestedPositions is null &&
+            state.Data.Truncation is null &&
+            state.Data.ExpirationTimeUtc is null &&
+            state.Data.ExtensionData is null &&
+            state.Data.UnknownProperties is null &&
+            state.ExtensionData is null &&
+            state.UnknownProperties is null;
+    }
+
+    private void ScheduleDeletionCheck(
+        AgentSessionId sessionId,
+        ILogger logger,
+        DateTime expirationTime)
+    {
+        DateTime currentTime = this._timeProvider.GetUtcNow().UtcDateTime;
         TimeSpan minimumDelay = this._options.MinimumTimeToLiveSignalDelay;
 
         // To avoid excessive scheduling, we schedule the deletion check for no less than the minimum delay.
@@ -211,7 +264,56 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
         this.Context.SignalEntity(
             this.Context.Id,
             nameof(CheckAndDeleteIfExpired), // self-signal
+            new AgentEntityDeletionCheck(expirationTime),
             options: new SignalEntityOptions { SignalTime = scheduledTime });
+    }
+
+    private DateTime? UpdateExpiration(
+        DurableAgentState workingState,
+        AgentSessionId sessionId,
+        ILogger logger)
+    {
+        TimeSpan? timeToLive = this._options.GetTimeToLive(sessionId.Name);
+        DateTime? previousExpirationTime = workingState.Data.ExpirationTimeUtc;
+        if (!timeToLive.HasValue)
+        {
+            if (previousExpirationTime.HasValue)
+            {
+                logger.LogTTLExpirationTimeCleared(sessionId);
+                workingState.Data.ExpirationTimeUtc = null;
+            }
+
+            return null;
+        }
+
+        DateTime newExpirationTime =
+            this._timeProvider.GetUtcNow().UtcDateTime.Add(timeToLive.Value);
+        workingState.Data.ExpirationTimeUtc = newExpirationTime;
+        logger.LogTTLExpirationTimeUpdated(sessionId, newExpirationTime);
+
+        // The first turn starts one delayed-check chain. An extension is picked up by the
+        // existing signal; only a shortened expiration needs a new earlier signal.
+        return !previousExpirationTime.HasValue ||
+            newExpirationTime < previousExpirationTime.Value
+                ? newExpirationTime
+                : null;
+    }
+
+    private void CommitWorkingState(
+        DurableAgentState workingState,
+        AgentSessionId sessionId,
+        ILogger logger,
+        DateTime? deletionCheckExpiration)
+    {
+        if (deletionCheckExpiration.HasValue)
+        {
+            // this.State still points at the hydrated state until the final assignment.
+            this.ScheduleDeletionCheck(sessionId, logger, deletionCheckExpiration.Value);
+        }
+
+        // This setter performs no synchronous backend I/O. TaskEntity persists the replacement
+        // only after the async operation completes successfully.
+        this.State = workingState;
     }
 
     private AIAgent GetAgent(AgentSessionId sessionId)
@@ -231,3 +333,5 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
         return this._loggerFactory.CreateLogger($"Microsoft.DurableTask.Agents.{agentName}.{sessionKey}");
     }
 }
+
+internal sealed record AgentEntityDeletionCheck(DateTime ExpectedExpirationTimeUtc);

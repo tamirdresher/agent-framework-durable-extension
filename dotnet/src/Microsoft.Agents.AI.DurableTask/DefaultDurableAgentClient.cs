@@ -17,6 +17,13 @@ internal class DefaultDurableAgentClient(DurableTaskClient client, ILoggerFactor
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        string correlationId = request.CorrelationId;
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            throw new ArgumentException(
+                "A non-empty correlation ID is required to run a durable agent request.",
+                nameof(request));
+        }
 
         this._logger.LogSignallingAgent(sessionId);
 
@@ -26,6 +33,6 @@ internal class DefaultDurableAgentClient(DurableTaskClient client, ILoggerFactor
             request,
             cancellation: cancellationToken);
 
-        return new AgentRunHandle(this._client, this._logger, sessionId, request.CorrelationId);
+        return new AgentRunHandle(this._client, this._logger, sessionId, correlationId);
     }
 }
