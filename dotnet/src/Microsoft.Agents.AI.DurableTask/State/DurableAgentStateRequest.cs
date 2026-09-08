@@ -49,13 +49,22 @@ internal sealed class DurableAgentStateRequest : DurableAgentStateEntry
     public static DurableAgentStateRequest FromRunRequest(
         RunRequest request,
         ILogger? logger = null)
+        => FromRunRequest(request, request.Messages, logger);
+
+    /// <summary>
+    /// Creates a request entry using the messages selected by the history-provider pipeline.
+    /// </summary>
+    public static DurableAgentStateRequest FromRunRequest(
+        RunRequest request,
+        IEnumerable<ChatMessage> messages,
+        ILogger? logger = null)
     {
         DateTimeOffset createdAt = request.Messages.Min(m => m.CreatedAt) ?? DateTimeOffset.UtcNow;
         return new DurableAgentStateRequest()
         {
             CorrelationId = request.CorrelationId,
             OrchestrationId = request.OrchestrationId,
-            Messages = request.Messages.Select(
+            Messages = messages.Select(
                 (message, index) => DurableAgentStateMessage.FromChatMessage(
                     message,
                     DurableAgentStateMessageIdentity.Create(
@@ -64,6 +73,31 @@ internal sealed class DurableAgentStateRequest : DurableAgentStateEntry
                         createdAt,
                         index),
                     logger)).ToList(),
+            CreatedAt = createdAt,
+            ResponseType = request.ResponseFormat is ChatResponseFormatJson ? "json" : "text",
+            ResponseSchema = (request.ResponseFormat as ChatResponseFormatJson)?.Schema
+        };
+    }
+
+    /// <summary>
+    /// Creates an exchange envelope that preserves request identity without duplicating transcript content.
+    /// </summary>
+    public static DurableAgentStateRequest FromRunRequestMetadata(RunRequest request)
+    {
+        DateTimeOffset createdAt = request.Messages.Min(message => message.CreatedAt) ?? DateTimeOffset.UtcNow;
+        return new DurableAgentStateRequest()
+        {
+            CorrelationId = request.CorrelationId,
+            OrchestrationId = request.OrchestrationId,
+            Messages = request.Messages.Select(
+                (message, index) => DurableAgentStateMessage.FromChatMessageMetadata(
+                    message,
+                    DurableAgentStateMessageIdentity.Create(
+                        "request",
+                        request.CorrelationId,
+                        createdAt,
+                        index),
+                    createdAt)).ToList(),
             CreatedAt = createdAt,
             ResponseType = request.ResponseFormat is ChatResponseFormatJson ? "json" : "text",
             ResponseSchema = (request.ResponseFormat as ChatResponseFormatJson)?.Schema

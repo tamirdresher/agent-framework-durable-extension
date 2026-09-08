@@ -17,8 +17,8 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
     private readonly ILoggerFactory _loggerFactory = services.GetRequiredService<ILoggerFactory>();
     private readonly IAgentResponseHandler? _messageHandler = services.GetService<IAgentResponseHandler>();
     private readonly DurableAgentsOptions _options = services.GetRequiredService<DurableAgentsOptions>();
-    // Entity operations execute once rather than replaying like orchestrations, and
-    // TaskEntityContext does not expose a deterministic clock.
+    // Entity operations rehydrate and execute once rather than replaying like orchestrations, and
+    // TaskEntityContext has no deterministic clock. Use wall-clock UTC through an injectable source.
     private readonly TimeProvider _timeProvider = services.GetService<TimeProvider>() ?? TimeProvider.System;
     private readonly CancellationToken _cancellationToken = cancellationToken != default
         ? cancellationToken
@@ -39,6 +39,7 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
         ArgumentNullException.ThrowIfNull(request);
 
         AgentSessionId sessionId = this.Context.Id;
+        // Logger category is Microsoft.DurableTask.Agents.{registeredAgentName}.{sessionId}
         ILogger logger = this.GetLogger(sessionId.Name, sessionId.Key);
 
         string correlationId = request.CorrelationId;
@@ -68,8 +69,9 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
 
         if (existingResponse is not null)
         {
-            // Correlation is the caller's idempotency key. Retained terminal state is reused
-            // without comparing request content, so callers must not reuse it for another request.
+            // Durable signals are delivered at least once. The correlation ID is the idempotency key, so a
+            // retained terminal response is reused without comparing request content. Callers must not reuse
+            // the ID for a different logical request while that terminal response is retained.
             return existingResponse.ToResponse();
         }
 
@@ -81,13 +83,17 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
         }
 
         AIAgent agent = this.GetAgent(sessionId);
-        EntityAgentWrapper agentWrapper = new(agent, this.Context, request, this._services);
+        bool serviceManagedPerServiceCallHistory =
+            this._options.IsServiceManagedPerServiceCallHistory(sessionId.Name);
+        ValidatedDurableAgentHistoryConfiguration validatedHistoryConfiguration =
+            DurableAgentHistoryOwnershipResolver.ValidateRunConfiguration(
+                agent,
+                serviceManagedPerServiceCallHistory);
 
-        // TaskEntity hydrates State with the backend-owned object. Mutate an independent copy so
-        // an exception leaves the hydrated state unchanged.
+        // TaskEntity hydrates State with the backend-owned reference. Provider callbacks, session state,
+        // and finalization all mutate objects, so a deep working copy preserves rollback when
+        // any later phase fails. Assigning State only at the end is not sufficient without this isolation.
         DurableAgentState workingState = this.State.Clone();
-        workingState.Data.ConversationHistory.Add(
-            DurableAgentStateRequest.FromRunRequest(request, logger));
 
         foreach (ChatMessage msg in request.Messages)
         {
@@ -105,10 +111,40 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
 
         try
         {
+            AgentSession session = await DurableAgentSessionState.RestoreAsync(
+                agent,
+                workingState.Data.Session,
+                this._cancellationToken).ConfigureAwait(false);
+            (DurableAgentHistoryOwnership ownership, ChatClientAgent? chatClientAgent) =
+                DurableAgentHistoryOwnershipResolver.Resolve(
+                    session,
+                    validatedHistoryConfiguration);
+            bool entityOwnedHistory = ownership == DurableAgentHistoryOwnership.Entity;
+            DurableAgentHistoryReplayMode historyReplayMode =
+                this._options.GetHistoryReplayMode(sessionId.Name);
+
+            // The provider is bound per invocation because it needs this operation's working state and
+            // correlation ID. A registration-time provider cannot safely bind either value.
+            DurableChatHistoryProvider? durableHistoryProvider = entityOwnedHistory
+                ? new(workingState.Data.ConversationHistory, request, logger)
+                : null;
+            EntityAgentWrapper agentWrapper = new(
+                agent,
+                this.Context,
+                request,
+                this._services,
+                durableHistoryProvider);
+
+            IEnumerable<ChatMessage> inputMessages = BuildAgentInputMessages(
+                workingState,
+                request,
+                ownership,
+                historyReplayMode);
+
             // Start the agent response stream
             IAsyncEnumerable<AgentResponseUpdate> responseStream = agentWrapper.RunStreamingAsync(
-                workingState.Data.ConversationHistory.SelectMany(e => e.Messages).Select(m => m.ToChatMessage()),
-                await agentWrapper.CreateSessionAsync(cancellationToken).ConfigureAwait(false),
+                inputMessages,
+                session,
                 options: null,
                 this._cancellationToken);
 
@@ -142,9 +178,21 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
                 response = responseUpdates.ToAgentResponse();
             }
 
-            // Persist the agent response to the entity state for client polling
-            workingState.Data.ConversationHistory.Add(
-                DurableAgentStateResponse.FromResponse(correlationId, response, logger));
+            FinalizeConversationEntries(
+                workingState,
+                request,
+                response,
+                ownership,
+                historyReplayMode,
+                durableHistoryProvider,
+                logger);
+
+            workingState.Data.Session = await SerializeSessionWithoutDuplicateHistoryAsync(
+                agent,
+                session,
+                chatClientAgent,
+                ownership,
+                this._cancellationToken).ConfigureAwait(false);
 
             string responseText = response.Text;
 
@@ -159,9 +207,13 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
                     response.Usage?.TotalTokenCount);
             }
 
-            DateTime? deletionCheckExpiration = this.UpdateExpiration(workingState, sessionId, logger);
-            this.CommitWorkingState(workingState, sessionId, logger, deletionCheckExpiration);
-
+            DateTime? deletionCheckExpiration =
+                this.UpdateExpiration(workingState, sessionId, logger);
+            this.CommitWorkingState(
+                workingState,
+                sessionId,
+                logger,
+                deletionCheckExpiration);
             return response;
         }
         catch (Exception exception)
@@ -193,7 +245,7 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
         logger.LogTTLDeletionCheck(sessionId, expirationTime, currentTime);
 
         // A delayed signal can outlive a deleted entity. TaskEntity initializes missing state
-        // before dispatch, so remove that otherwise-empty placeholder instead of recreating it.
+        // before dispatch, so delete that otherwise-empty placeholder instead of recreating it.
         if (!expirationTime.HasValue && IsEmptyInitializedState(this.State))
         {
             this.State = null!;
@@ -203,6 +255,7 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
         if (!this._options.ContainsAgent(sessionId.Name) ||
             !this._options.GetTimeToLive(sessionId.Name).HasValue)
         {
+            // Configuration can change while a durable delayed signal is outstanding.
             if (expirationTime.HasValue)
             {
                 logger.LogTTLExpirationTimeCleared(sessionId);
@@ -224,7 +277,8 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
             return;
         }
 
-        // A shorter TTL creates an earlier signal. Its older, later counterpart is stale.
+        // Later interactions normally extend expiration and let the earlier signal move the chain
+        // forward. A shorter TTL schedules an earlier signal; its older, later counterpart is stale.
         if (scheduledCheck is null ||
             scheduledCheck.ExpectedExpirationTimeUtc <= expirationTime.Value)
         {
@@ -268,6 +322,82 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
             options: new SignalEntityOptions { SignalTime = scheduledTime });
     }
 
+    private static IEnumerable<ChatMessage> BuildAgentInputMessages(
+        DurableAgentState workingState,
+        RunRequest request,
+        DurableAgentHistoryOwnership ownership,
+        DurableAgentHistoryReplayMode historyReplayMode)
+    {
+        if (ownership != DurableAgentHistoryOwnership.NoContextPipeline ||
+            historyReplayMode == DurableAgentHistoryReplayMode.CurrentRequestOnly)
+        {
+            // A MAF history/context pipeline or a server-owned opaque session supplies prior context.
+            // Passing stored history here as well would duplicate messages.
+            return request.Messages;
+        }
+
+        // Legacy generic AIAgents have no discoverable context pipeline. In the backward-compatible
+        // preload mode, the entity manually replays prior durable history before the current request.
+        return DurableAgentStateReplay.GetMessages(
+                workingState.Data.ConversationHistory,
+                request.CorrelationId)
+            .Concat(request.Messages);
+    }
+
+    private static void FinalizeConversationEntries(
+        DurableAgentState workingState,
+        RunRequest request,
+        AgentResponse response,
+        DurableAgentHistoryOwnership ownership,
+        DurableAgentHistoryReplayMode historyReplayMode,
+        DurableChatHistoryProvider? durableHistoryProvider,
+        ILogger logger)
+    {
+        if (durableHistoryProvider?.HasStagedTurn is true)
+        {
+            // Provider callbacks already staged the entity-owned request and response. Replace only
+            // the staged response so aggregate usage and response metadata are retained once.
+            durableHistoryProvider.CompleteStagedResponse(response);
+            return;
+        }
+
+        bool entityReplaysHistory =
+            ownership == DurableAgentHistoryOwnership.NoContextPipeline &&
+            historyReplayMode == DurableAgentHistoryReplayMode.PreloadEntityHistory;
+        workingState.Data.ConversationHistory.Add(
+            entityReplaysHistory
+                ? DurableAgentStateRequest.FromRunRequest(request, logger)
+                : DurableAgentStateRequest.FromRunRequestMetadata(request));
+
+        // External providers, services, and opaque session-managed agents own their transcript.
+        // The entity still records the completed outer response for at-least-once delivery/polling.
+        workingState.Data.ConversationHistory.Add(
+            DurableAgentStateResponse.FromResponse(request.CorrelationId, response, logger));
+    }
+
+    private static ValueTask<System.Text.Json.JsonElement> SerializeSessionWithoutDuplicateHistoryAsync(
+        AIAgent agent,
+        AgentSession session,
+        ChatClientAgent? chatClientAgent,
+        DurableAgentHistoryOwnership ownership,
+        CancellationToken cancellationToken)
+    {
+        // InMemoryChatHistoryProvider state can contain a full transcript already retained by the
+        // entity. Exclude only that provider's declared keys; custom, compaction, and opaque
+        // server-session state remains authoritative and is preserved.
+        IEnumerable<string> excludedStateKeys =
+            chatClientAgent?.ChatHistoryProvider is InMemoryChatHistoryProvider inMemoryHistoryProvider &&
+            ownership is DurableAgentHistoryOwnership.Entity or DurableAgentHistoryOwnership.Service
+                ? inMemoryHistoryProvider.StateKeys
+                : [];
+
+        return DurableAgentSessionState.SerializeAsync(
+            agent,
+            session,
+            excludedStateKeys,
+            cancellationToken);
+    }
+
     private DateTime? UpdateExpiration(
         DurableAgentState workingState,
         AgentSessionId sessionId,
@@ -291,8 +421,8 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
         workingState.Data.ExpirationTimeUtc = newExpirationTime;
         logger.LogTTLExpirationTimeUpdated(sessionId, newExpirationTime);
 
-        // The first turn starts one delayed-check chain. An extension is picked up by the
-        // existing signal; only a shortened expiration needs a new earlier signal.
+        // The first turn starts one delayed-check chain. Extended expirations are picked up by the
+        // earlier check; only a shortened expiration needs a new earlier signal.
         return !previousExpirationTime.HasValue ||
             newExpirationTime < previousExpirationTime.Value
                 ? newExpirationTime
@@ -307,12 +437,13 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
     {
         if (deletionCheckExpiration.HasValue)
         {
-            // this.State still points at the hydrated state until the final assignment.
+            // Pass the working-copy value explicitly: this.State still refers to the original state
+            // until the operation commits.
             this.ScheduleDeletionCheck(sessionId, logger, deletionCheckExpiration.Value);
         }
 
-        // This setter performs no synchronous backend I/O. TaskEntity persists the replacement
-        // only after the async operation completes successfully.
+        // This setter performs no backend I/O. TaskEntity writes the replacement state only after
+        // this async operation completes successfully; an exception before then leaves storage unchanged.
         this.State = workingState;
     }
 
