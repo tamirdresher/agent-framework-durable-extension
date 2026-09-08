@@ -91,7 +91,7 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
                 serviceManagedPerServiceCallHistory);
 
         // TaskEntity hydrates State with the backend-owned reference. Provider callbacks, session state,
-        // and finalization all mutate objects, so a deep working copy preserves rollback when
+        // finalization, and retention all mutate objects, so a deep working copy preserves rollback when
         // any later phase fails. Assigning State only at the end is not sufficient without this isolation.
         DurableAgentState workingState = this.State.Clone();
 
@@ -209,7 +209,7 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
 
             DateTime? deletionCheckExpiration =
                 this.UpdateExpiration(workingState, sessionId, logger);
-            this.CommitWorkingState(
+            this.ApplyRetentionAndCommit(
                 workingState,
                 sessionId,
                 logger,
@@ -429,12 +429,20 @@ internal class AgentEntity(IServiceProvider services, CancellationToken cancella
                 : null;
     }
 
-    private void CommitWorkingState(
+    private void ApplyRetentionAndCommit(
         DurableAgentState workingState,
         AgentSessionId sessionId,
         ILogger logger,
         DateTime? deletionCheckExpiration)
     {
+        _ = DurableAgentStateRetention.Enforce(
+            workingState,
+            this._options.HistoryRetentionMode,
+            this._options.MaxStateBytes,
+            this._timeProvider.GetUtcNow(),
+            logger,
+            sessionId);
+
         if (deletionCheckExpiration.HasValue)
         {
             // Pass the working-copy value explicitly: this.State still refers to the original state

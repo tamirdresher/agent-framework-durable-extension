@@ -60,6 +60,30 @@ public sealed class DurableAgentsOptions
     } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Gets or sets how durable agent conversation state is retained. Defaults to
+    /// <see cref="DurableAgentHistoryRetentionMode.Auto"/>.
+    /// </summary>
+    public DurableAgentHistoryRetentionMode HistoryRetentionMode { get; set; } =
+        DurableAgentHistoryRetentionMode.Auto;
+
+    /// <summary>
+    /// Gets or sets the extension-controlled serialized state budget used by automatic retention.
+    /// Defaults to 1 MiB.
+    /// </summary>
+    /// <remarks>
+    /// This budget measures the exact JSON payload produced by this extension. Durable Task backends can add
+    /// envelope bytes outside this payload, so the default retention watermarks intentionally leave headroom.
+    /// Automatic retention fails the operation if protected state cannot be reduced below the high watermark.
+    /// </remarks>
+    public int MaxStateBytes
+    {
+        get;
+        set => field = value > 0
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), value, "The durable agent state budget must be positive.");
+    } = 1_048_576;
+
+    /// <summary>
     /// Declares that the model service manages history for an agent that enables Agent Framework's
     /// per-service-call history persistence mode.
     /// </summary>
