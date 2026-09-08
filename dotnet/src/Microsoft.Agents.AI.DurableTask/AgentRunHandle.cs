@@ -21,6 +21,8 @@ internal sealed class AgentRunHandle
         AgentSessionId sessionId,
         string correlationId)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+
         this._client = client;
         this._logger = logger;
         this.SessionId = sessionId;
@@ -61,10 +63,22 @@ internal sealed class AgentRunHandle
 
             if (state?.Data.ConversationHistory is not null)
             {
-                // Look for an agent response with matching CorrelationId
-                DurableAgentStateResponse? response = state.Data.ConversationHistory
-                    .OfType<DurableAgentStateResponse>()
-                    .FirstOrDefault(r => r.CorrelationId == this.CorrelationId);
+                DurableAgentStateResponse? response;
+                try
+                {
+                    response = DurableAgentStateTerminalResponseLookup.FindUniqueTerminalResponse(
+                        state.Data.ConversationHistory,
+                        this.CorrelationId);
+                }
+                catch (DurableAgentStateCorruptionException exception)
+                {
+                    this._logger.LogTerminalResponseStateCorruption(
+                        exception,
+                        this.SessionId,
+                        this.CorrelationId,
+                        exception.TerminalResponseCount.GetValueOrDefault());
+                    throw;
+                }
 
                 if (response is not null)
                 {

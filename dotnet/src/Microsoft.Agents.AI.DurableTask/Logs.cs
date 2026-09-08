@@ -102,6 +102,26 @@ internal static partial class Logs
         AgentSessionId sessionId);
 
     [LoggerMessage(
+        EventId = 14,
+        Level = LogLevel.Error,
+        Message = "[{SessionId}] Durable agent execution failed.")]
+    public static partial void LogDurableAgentExecutionFailed(
+        this ILogger logger,
+        Exception exception,
+        AgentSessionId sessionId);
+
+    [LoggerMessage(
+        EventId = 17,
+        Level = LogLevel.Error,
+        Message = "[{SessionId}] Durable agent state contains {TerminalResponseCount} terminal responses for correlation ID '{CorrelationId}'.")]
+    public static partial void LogTerminalResponseStateCorruption(
+        this ILogger logger,
+        Exception exception,
+        AgentSessionId sessionId,
+        string correlationId,
+        int terminalResponseCount);
+
+    [LoggerMessage(
         EventId = 16,
         Level = LogLevel.Warning,
         Message = "Unknown AI content metadata with runtime type '{RuntimeType}' could not be serialized. The value was omitted from durable state with failure category '{FailureCategory}'.")]
