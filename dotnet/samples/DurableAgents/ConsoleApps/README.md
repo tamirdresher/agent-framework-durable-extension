@@ -9,6 +9,8 @@ This directory contains samples for console app hosting of durable agents. These
 - **[05_AgentOrchestration_HITL](05_AgentOrchestration_HITL)**: A sample that demonstrates how to implement a human-in-the-loop workflow using durable orchestration, including interactive approval prompts.
 - **[06_LongRunningTools](06_LongRunningTools)**: A sample that demonstrates how agents can start and interact with durable orchestrations from tool calls to enable long-running tool scenarios.
 - **[07_ReliableStreaming](07_ReliableStreaming)**: A sample that demonstrates how to implement reliable streaming for durable agents using Redis Streams, enabling clients to disconnect and reconnect without losing messages.
+- **[08_FoundryManagedAgent](08_FoundryManagedAgent)**: A sample that wraps a server-managed, versioned Microsoft Foundry agent as a durable agent and restores its service conversation across a host restart.
+- **[09_CustomHistoryProvider](09_CustomHistoryProvider)**: A JSON-file external history provider that retains more than 1 MiB of cumulative history, projects a bounded model window, and restores continuity across a durable host restart.
 
 ## Running the Samples
 

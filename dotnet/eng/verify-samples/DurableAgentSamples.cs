@@ -91,6 +91,43 @@ internal static class DurableAgentSamples
                 "The output should not contain error messages or stack traces.",
             ],
         },
+        new SampleDefinition
+        {
+            Name = "DurableAgents_Console_08_FoundryManagedAgent",
+            ProjectPath = "samples/DurableAgents/ConsoleApps/08_FoundryManagedAgent",
+            RequiredEnvironmentVariables =
+            [
+                "FOUNDRY_PROJECT_ENDPOINT",
+                "FOUNDRY_MODEL",
+                "DURABLE_TASK_SCHEDULER_CONNECTION_STRING",
+            ],
+            MustContain =
+            [
+                "Host stopped. Starting a new host to force durable state restoration.",
+                "Conversation continuity check: PASS",
+                "Deleted Foundry agent version:",
+            ],
+            IsDeterministic = true,
+        },
+        new SampleDefinition
+        {
+            Name = "DurableAgents_Console_09_CustomHistoryProvider",
+            ProjectPath = "samples/DurableAgents/ConsoleApps/09_CustomHistoryProvider",
+            RequiredEnvironmentVariables =
+            [
+                "FOUNDRY_PROJECT_ENDPOINT",
+                "FOUNDRY_MODEL",
+                "DURABLE_TASK_SCHEDULER_CONNECTION_STRING",
+            ],
+            Inputs = ["SAMPLE-MARKER-09"],
+            ExpectedOutputDescription =
+            [
+                "The output should state that cumulative external history exceeds 1 MiB using moderate records, not one oversized durable request.",
+                "The output should show a bounded provider-supplied model-history window.",
+                "The output should show that the marker and conversation continuity survive a host restart.",
+                "The output should not contain error messages or stack traces.",
+            ],
+        },
     ];
 
     public static IReadOnlyList<SampleDefinition> AzureFunctions { get; } =
