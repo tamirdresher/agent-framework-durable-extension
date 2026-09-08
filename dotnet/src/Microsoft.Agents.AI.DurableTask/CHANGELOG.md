@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added pressure-based durable history retention and low-cardinality operational metrics.
 - Added durable chat history ownership and opaque agent-session persistence without duplicating provider- or service-owned transcripts.
 - Hardened durable-agent duplicate delivery, correlation validation, working-state rollback, and stale-safe TTL deletion scheduling.
 - Fixed `ConfigureDurableAgents` and `ConfigureDurableWorkflows` ignoring the `workerBuilder` or `clientBuilder` supplied to a later call when no earlier call supplied one, so the Durable Task worker and client are now registered whichever configuration call provides them. The first non-null delegate wins; later ones are still ignored so a builder passed to several calls is only applied once. Registering an agent that a workflow already referenced now promotes it to an explicitly registered agent instead of throwing, so agents and workflows can be configured in either order ([#67](https://github.com/microsoft/agent-framework-durable-extension/pull/67))

@@ -102,6 +102,28 @@ internal static partial class Logs
         AgentSessionId sessionId);
 
     [LoggerMessage(
+        EventId = 12,
+        Level = LogLevel.Warning,
+        Message = "[{SessionId}] Durable state reached {InitialSizeBytes} bytes of a {MaxStateBytes} byte budget. Retention evicted {EvictedMessageCount} message(s), leaving {FinalSizeBytes} bytes.")]
+    public static partial void LogDurableHistoryTruncated(
+        this ILogger logger,
+        AgentSessionId sessionId,
+        int initialSizeBytes,
+        int maxStateBytes,
+        int evictedMessageCount,
+        int finalSizeBytes);
+
+    [LoggerMessage(
+        EventId = 13,
+        Level = LogLevel.Error,
+        Message = "[{SessionId}] Durable state remains {StateSizeBytes} bytes against a {MaxStateBytes} byte budget after retention. Protected system messages, the newest exchange, and pollable responses were not removed.")]
+    public static partial void LogDurableHistoryStillOverBudget(
+        this ILogger logger,
+        AgentSessionId sessionId,
+        int stateSizeBytes,
+        int maxStateBytes);
+
+    [LoggerMessage(
         EventId = 14,
         Level = LogLevel.Error,
         Message = "[{SessionId}] Durable agent execution failed while restoring, running, or serializing the inner agent session.")]
@@ -109,6 +131,18 @@ internal static partial class Logs
         this ILogger logger,
         Exception exception,
         AgentSessionId sessionId);
+
+    [LoggerMessage(
+        EventId = 15,
+        Level = LogLevel.Error,
+        Message = "[{SessionId}] Retention evicted {EvictedMessageCount} message(s) from responses completed within the last {DeliveryWindowSeconds} seconds to keep state within budget. Callers still polling those responses must retry. Final state is {FinalSizeBytes} bytes against a {MaxStateBytes} byte budget.")]
+    public static partial void LogDurableHistoryDeliveryResponsesEvicted(
+        this ILogger logger,
+        AgentSessionId sessionId,
+        int evictedMessageCount,
+        double deliveryWindowSeconds,
+        int finalSizeBytes,
+        int maxStateBytes);
 
     [LoggerMessage(
         EventId = 16,

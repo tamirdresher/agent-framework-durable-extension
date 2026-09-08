@@ -583,6 +583,49 @@ public sealed class AgentEntityHistoryTests
     }
 
     [Fact]
+    public async Task AutoRetentionRunsOnCompletedEntityExecutionAsync()
+    {
+        RecordingChatClient client = new();
+        ChatClientAgent agent = new(client, name: "agent");
+        DurableAgentState initialState = CreateLargeState();
+
+        DurableAgentState persisted = await RunEntityAsync(
+            agent,
+            initialState,
+            new RunRequest(new string('n', 500)) { CorrelationId = "new" },
+            options =>
+            {
+                options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+                options.MaxStateBytes = 1_800;
+            });
+
+        Assert.NotNull(persisted.Data.Truncation);
+        Assert.DoesNotContain(persisted.Data.ConversationHistory, entry => entry.CorrelationId == "oldest");
+        Assert.Contains(persisted.Data.ConversationHistory, entry => entry.CorrelationId == "new");
+    }
+
+    [Fact]
+    public async Task OversizedProtectedStateFailsWithoutPersistenceAsync()
+    {
+        RecordingChatClient client = new();
+        ChatClientAgent agent = new(client, name: "agent");
+        EntityHarness harness = CreateHarness(
+            agent,
+            new DurableAgentState(),
+            options =>
+            {
+                options.HistoryRetentionMode = DurableAgentHistoryRetentionMode.Auto;
+                options.MaxStateBytes = 500;
+            });
+
+        await Assert.ThrowsAsync<DurableAgentStateSizeLimitExceededException>(
+            () => harness.RunAsync(
+                new RunRequest(new string('x', 2_000)) { CorrelationId = "new" }));
+
+        Assert.False(harness.StateWasPersisted);
+    }
+
+    [Fact]
     public async Task ProviderLoadFailureDoesNotInvokeModelOrCommitWorkingStateAsync()
     {
         InvalidOperationException expected = new("provider load failed");
@@ -878,6 +921,15 @@ public sealed class AgentEntityHistoryTests
     {
         DurableAgentState state = new();
         AddExchange(state, correlationId, request, response, DateTimeOffset.UtcNow.AddMinutes(-5));
+        return state;
+    }
+
+    private static DurableAgentState CreateLargeState()
+    {
+        DurableAgentState state = new();
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        AddExchange(state, "oldest", new string('a', 600), new string('b', 600), now.AddMinutes(-10));
+        AddExchange(state, "middle", new string('c', 600), new string('d', 600), now.AddMinutes(-5));
         return state;
     }
 
