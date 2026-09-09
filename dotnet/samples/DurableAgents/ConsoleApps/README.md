@@ -11,6 +11,7 @@ This directory contains samples for console app hosting of durable agents. These
 - **[07_ReliableStreaming](07_ReliableStreaming)**: A sample that demonstrates how to implement reliable streaming for durable agents using Redis Streams, enabling clients to disconnect and reconnect without losing messages.
 - **[08_FoundryManagedAgent](08_FoundryManagedAgent)**: A sample that wraps a server-managed, versioned Microsoft Foundry agent as a durable agent and restores its service conversation across a host restart.
 - **[09_CustomHistoryProvider](09_CustomHistoryProvider)**: A JSON-file external history provider that retains more than 1 MiB of cumulative history, projects a bounded model window, and restores continuity across a durable host restart.
+- **[10_AutoHistoryRetention](10_AutoHistoryRetention)**: A sample that demonstrates automatic pressure-based durable history retention, OpenTelemetry metrics, and a marker recall diagnostic.
 
 ## Running the Samples
 
